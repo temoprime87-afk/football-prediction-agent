@@ -2,15 +2,20 @@ name: FPL Prediction Agent
 
 on:
   workflow_dispatch:
+
   schedule:
+    # كل نهار مع 18:00 UTC
     - cron: "0 18 * * *"
+
+permissions:
+  contents: write
 
 jobs:
   predict:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -20,14 +25,27 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
 
-      - name: Run agent
+      - name: Run FPL Prediction Agent
         run: |
           python main.py
 
-      - name: Save FPL data
+      - name: Check generated files
+        run: |
+          echo "Generated files:"
+          ls -lah
+          if [ -f fpl_data.json ]; then
+            echo "fpl_data.json created successfully"
+          fi
+
+      - name: Upload prediction data
         uses: actions/upload-artifact@v4
         with:
-          name: fpl-data
-          path: fpl_data.json
+          name: fpl-prediction-data
+          path: |
+            fpl_data.json
+          if-no-files-found: warn
