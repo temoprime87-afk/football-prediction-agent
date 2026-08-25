@@ -1,91 +1,205 @@
-import os
 import json
 import math
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 
 
 # ============================================================
-# FOOTBALL PREDICTION AGENT
-# Version 1.0
+# FPL AUTONOMOUS ANALYST
+# ============================================================
+#
+# No API KEY required.
+#
+# Main outputs:
+#   - Best 15-player squad under £100m
+#   - Starting XI
+#   - Bench
+#   - Captain
+#   - Vice-Captain
+#   - Fixture analysis
+#   - Match predictions
+#   - Correct-score probabilities
+#   - Likely goal scorers
+#
+# Data source:
+#   Official Fantasy Premier League public API
+#
 # ============================================================
 
-API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")
 
-BASE_URL = "https://api.football-data.org/v4"
+BASE_URL = "https://fantasy.premierleague.com/api"
 
-LAST_MATCHES = 10
-MAX_GOALS = 6
+TEAM_ID = 9623737
 
-COMPETITIONS = {
-    "PL": "Premier League",
-    "PD": "La Liga",
-    "SA": "Serie A",
-    "BL1": "Bundesliga",
-    "FL1": "Ligue 1",
+BUDGET = 100.0
+
+SQUAD_SIZE = 15
+
+MAX_PER_CLUB = 3
+
+TOP_CANDIDATES_PER_POSITION = 80
+
+UPCOMING_FIXTURES_TO_ANALYSE = 5
+
+REQUEST_DELAY = 0.15
+
+USER_AGENT = (
+    "Mozilla/5.0 "
+    "(Linux; Android 14) "
+    "AppleWebKit/537.36 "
+    "(KHTML, like Gecko) "
+    "Chrome/131.0 Mobile Safari/537.36"
+)
+
+
+# ============================================================
+# POSITION DATA
+# ============================================================
+
+POSITION_NAMES = {
+    1: "GK",
+    2: "DEF",
+    3: "MID",
+    4: "FWD",
 }
 
 
+SQUAD_REQUIREMENTS = {
+    "GK": 2,
+    "DEF": 5,
+    "MID": 5,
+    "FWD": 3,
+}
+
+
+STARTING_FORMATIONS = [
+    (3, 4, 3),
+    (3, 5, 2),
+    (4, 3, 3),
+    (4, 4, 2),
+    (4, 5, 1),
+    (5, 3, 2),
+    (5, 4, 1),
+]
+
+
 # ============================================================
-# API
+# HTTP
 # ============================================================
 
-def get_json(url):
+def get_json(url, retries=4):
 
-    if not API_KEY:
-        raise RuntimeError(
-            "FOOTBALL_DATA_API_KEY is not configured."
-        )
+    last_error = None
 
-    request = urllib.request.Request(
-        url,
-        headers={
-            "X-Auth-Token": API_KEY,
-            "User-Agent": "FootballPredictionAgent/1.0",
-            "Accept": "application/json",
-        },
-        method="GET",
-    )
+    for attempt in range(retries):
 
-    try:
+        try:
 
-        with urllib.request.urlopen(
-            request,
-            timeout=30
-        ) as response:
-
-            return json.loads(
-                response.read().decode("utf-8")
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "application/json",
+                    "Referer": (
+                        "https://fantasy.premierleague.com/"
+                    ),
+                },
+                method="GET",
             )
 
-    except urllib.error.HTTPError as error:
+            with urllib.request.urlopen(
+                request,
+                timeout=30,
+            ) as response:
 
-        body = error.read().decode(
-            "utf-8",
-            errors="ignore"
-        )
+                raw = response.read().decode(
+                    "utf-8"
+                )
 
-        raise RuntimeError(
-            f"HTTP {error.code}: {body}"
-        )
+                time.sleep(
+                    REQUEST_DELAY
+                )
 
-    except urllib.error.URLError as error:
+                return json.loads(raw)
 
-        raise RuntimeError(
-            f"Network error: {error.reason}"
-        )
+        except urllib.error.HTTPError as error:
+
+            last_error = (
+                f"HTTP {error.code}: "
+                f"{error.reason}"
+            )
+
+            if error.code in (
+                429,
+                500,
+                502,
+                503,
+                504,
+            ):
+
+                time.sleep(
+                    2 + attempt * 2
+                )
+
+                continue
+
+            break
+
+        except urllib.error.URLError as error:
+
+            last_error = (
+                f"Network error: "
+                f"{error.reason}"
+            )
+
+            time.sleep(
+                2 + attempt * 2
+            )
+
+        except Exception as error:
+
+            last_error = str(error)
+
+            time.sleep(
+                2 + attempt * 2
+            )
+
+    raise RuntimeError(
+        f"{last_error} | URL: {url}"
+    )
 
 
 # ============================================================
-# HELPERS
+# SAFE CONVERSIONS
 # ============================================================
 
-def safe_float(value, default=0.0):
+def number(value, default=0.0):
 
     try:
+
+        if value is None:
+            return default
+
         return float(value)
+
     except:
+
+        return default
+
+
+def integer(value, default=0):
+
+    try:
+
+        if value is None:
+            return default
+
+        return int(value)
+
+    except:
+
         return default
 
 
@@ -93,560 +207,2046 @@ def clamp(value, minimum, maximum):
 
     return max(
         minimum,
-        min(maximum, value)
+        min(
+            maximum,
+            value,
+        ),
     )
 
 
+def round2(value):
+
+    return round(
+        number(value),
+        2,
+    )
+
+
+def money_from_fpl_cost(value):
+
+    return round(
+        number(value) / 10,
+        1,
+    )
+
+
+# ============================================================
+# POISSON
+# ============================================================
+
 def poisson_probability(
     goals,
-    expected_goals
+    expected_goals,
 ):
 
     expected_goals = max(
         expected_goals,
-        0.01
+        0.01,
     )
 
     return (
         math.exp(-expected_goals)
         *
-        expected_goals ** goals
+        (
+            expected_goals ** goals
+        )
         /
         math.factorial(goals)
     )
 
 
 # ============================================================
-# GET FINISHED MATCHES
+# LOAD FPL DATABASE
 # ============================================================
 
-def get_team_matches(
-    competition,
-    team_id
-):
+def load_fpl_database():
 
-    url = (
-        f"{BASE_URL}/teams/"
-        f"{team_id}/matches"
-        f"?competitions={competition}"
-        f"&status=FINISHED"
-        f"&limit={LAST_MATCHES}"
+    print("")
+    print("=" * 60)
+    print("LOADING OFFICIAL FPL DATABASE")
+    print("=" * 60)
+
+    bootstrap = get_json(
+        f"{BASE_URL}/bootstrap-static/"
     )
 
-    data = get_json(url)
+    fixtures = get_json(
+        f"{BASE_URL}/fixtures/"
+    )
 
-    return data.get(
-        "matches",
-        []
+    players = bootstrap.get(
+        "elements",
+        [],
+    )
+
+    events = bootstrap.get(
+        "events",
+        [],
+    )
+
+    teams = bootstrap.get(
+        "teams",
+        [],
+    )
+
+    print(
+        "Players:",
+        len(players),
+    )
+
+    print(
+        "Teams:",
+        len(teams),
+    )
+
+    print(
+        "Fixtures:",
+        len(fixtures),
+    )
+
+    print(
+        "Gameweeks:",
+        len(events),
+    )
+
+    return {
+        "bootstrap": bootstrap,
+        "players": players,
+        "events": events,
+        "teams": teams,
+        "fixtures": fixtures,
+    }
+
+
+# ============================================================
+# GAMEWEEK
+# ============================================================
+
+def get_gameweek_info(events):
+
+    current = None
+    next_event = None
+
+    for event in events:
+
+        if event.get("is_current"):
+
+            current = integer(
+                event.get("id")
+            )
+
+        if event.get("is_next"):
+
+            next_event = integer(
+                event.get("id")
+            )
+
+
+    if current is None:
+
+        for event in events:
+
+            if event.get("finished"):
+
+                current = integer(
+                    event.get("id")
+                )
+
+
+    if current is None:
+
+        current = 0
+
+
+    if next_event is None:
+
+        next_event = current + 1
+
+
+    return {
+        "current": current,
+        "next": next_event,
+    }
+
+
+# ============================================================
+# TEAM LOOKUP
+# ============================================================
+
+def build_team_lookup(teams):
+
+    lookup = {}
+
+    for team in teams:
+
+        team_id = integer(
+            team.get("id")
+        )
+
+        lookup[team_id] = team
+
+    return lookup
+
+
+# ============================================================
+# FIXTURE MAP
+# ============================================================
+
+def build_fixture_map(
+    fixtures
+):
+
+    fixture_map = {}
+
+    for fixture in fixtures:
+
+        event = fixture.get(
+            "event"
+        )
+
+        if event is None:
+            continue
+
+        event = integer(event)
+
+        home_team = integer(
+            fixture.get("team_h")
+        )
+
+        away_team = integer(
+            fixture.get("team_a")
+        )
+
+        if not home_team or not away_team:
+            continue
+
+
+        home_difficulty = number(
+            fixture.get(
+                "team_h_difficulty",
+                3,
+            ),
+            3,
+        )
+
+        away_difficulty = number(
+            fixture.get(
+                "team_a_difficulty",
+                3,
+            ),
+            3,
+        )
+
+
+        fixture_map.setdefault(
+            home_team,
+            [],
+        ).append({
+
+            "event": event,
+
+            "opponent": away_team,
+
+            "home": True,
+
+            "difficulty":
+                home_difficulty,
+
+            "finished":
+                bool(
+                    fixture.get(
+                        "finished",
+                        False,
+                    )
+                ),
+
+            "kickoff":
+                fixture.get(
+                    "kickoff_time"
+                ),
+
+            "fixture_id":
+                fixture.get("id"),
+
+        })
+
+
+        fixture_map.setdefault(
+            away_team,
+            [],
+        ).append({
+
+            "event": event,
+
+            "opponent": home_team,
+
+            "home": False,
+
+            "difficulty":
+                away_difficulty,
+
+            "finished":
+                bool(
+                    fixture.get(
+                        "finished",
+                        False,
+                    )
+                ),
+
+            "kickoff":
+                fixture.get(
+                    "kickoff_time"
+                ),
+
+            "fixture_id":
+                fixture.get("id"),
+
+        })
+
+
+    return fixture_map
+
+
+# ============================================================
+# UPCOMING FIXTURES
+# ============================================================
+
+def get_upcoming_fixtures(
+    team_id,
+    fixture_map,
+    current_gameweek,
+    limit=5,
+):
+
+    fixtures = []
+
+    for fixture in fixture_map.get(
+        team_id,
+        [],
+    ):
+
+        if fixture["finished"]:
+            continue
+
+        if fixture["event"] <= current_gameweek:
+            continue
+
+        fixtures.append(
+            fixture
+        )
+
+
+    fixtures.sort(
+        key=lambda item:
+        item["event"]
+    )
+
+
+    return fixtures[:limit]
+
+
+# ============================================================
+# FIXTURE SCORE
+# ============================================================
+
+def calculate_fixture_score(
+    upcoming,
+):
+
+    if not upcoming:
+
+        return 2.5
+
+
+    values = []
+
+    for fixture in upcoming:
+
+        difficulty = clamp(
+            number(
+                fixture.get(
+                    "difficulty",
+                    3,
+                ),
+                3,
+            ),
+            1,
+            5,
+        )
+
+        # FPL difficulty:
+        # 1 = easiest
+        # 5 = hardest
+
+        score = (
+            6 - difficulty
+        )
+
+        values.append(
+            score
+        )
+
+
+    average = (
+        sum(values)
+        /
+        len(values)
+    )
+
+
+    return clamp(
+        average,
+        0,
+        5,
     )
 
 
 # ============================================================
-# TEAM STATISTICS
+# PLAYER ANALYSIS
 # ============================================================
 
-def calculate_team_stats(
-    matches,
-    team_id
+def analyse_player(
+    player,
+    team_lookup,
+    fixture_map,
+    current_gameweek,
 ):
 
-    if not matches:
+    player_id = integer(
+        player.get("id")
+    )
 
-        return {
-            "matches": 0,
-            "goals_for": 0,
-            "goals_against": 0,
-            "goals_for_avg": 0,
-            "goals_against_avg": 0,
-            "wins": 0,
-            "draws": 0,
-            "losses": 0,
-            "points": 0,
-            "points_per_match": 0,
-            "win_rate": 0,
+    team_id = integer(
+        player.get("team")
+    )
+
+    position_id = integer(
+        player.get(
+            "element_type"
+        )
+    )
+
+    team = team_lookup.get(
+        team_id,
+        {},
+    )
+
+
+    name = player.get(
+        "web_name",
+        "Unknown",
+    )
+
+    first_name = player.get(
+        "first_name",
+        "",
+    )
+
+    second_name = player.get(
+        "second_name",
+        "",
+    )
+
+
+    full_name = (
+        f"{first_name} "
+        f"{second_name}"
+    ).strip()
+
+
+    position = POSITION_NAMES.get(
+        position_id,
+        "?",
+    )
+
+    club = team.get(
+        "short_name",
+        "UNK",
+    )
+
+
+    price = money_from_fpl_cost(
+        player.get("now_cost")
+    )
+
+
+    total_points = number(
+        player.get(
+            "total_points"
+        )
+    )
+
+    form = number(
+        player.get("form")
+    )
+
+    points_per_game = number(
+        player.get(
+            "points_per_game"
+        )
+    )
+
+    minutes = number(
+        player.get("minutes")
+    )
+
+    starts = number(
+        player.get("starts")
+    )
+
+    goals = number(
+        player.get(
+            "goals_scored"
+        )
+    )
+
+    assists = number(
+        player.get(
+            "assists"
+        )
+    )
+
+    clean_sheets = number(
+        player.get(
+            "clean_sheets"
+        )
+    )
+
+    bonus = number(
+        player.get(
+            "bonus"
+        )
+    )
+
+    ict_index = number(
+        player.get(
+            "ict_index"
+        )
+    )
+
+    influence = number(
+        player.get(
+            "influence"
+        )
+    )
+
+    creativity = number(
+        player.get(
+            "creativity"
+        )
+    )
+
+    threat = number(
+        player.get(
+            "threat"
+        )
+    )
+
+    expected_goals = number(
+        player.get(
+            "expected_goals"
+        )
+    )
+
+    expected_assists = number(
+        player.get(
+            "expected_assists"
+        )
+    )
+
+    expected_goal_involvement = (
+        expected_goals
+        +
+        expected_assists
+    )
+
+
+    chance_current = player.get(
+        "chance_of_playing_this_round"
+    )
+
+    chance_next = player.get(
+        "chance_of_playing_next_round"
+    )
+
+
+    if chance_current is None:
+        chance_current = 100
+
+    else:
+        chance_current = number(
+            chance_current
+        )
+
+
+    if chance_next is None:
+        chance_next = 100
+
+    else:
+        chance_next = number(
+            chance_next
+        )
+
+
+    status = player.get(
+        "status"
+    )
+
+
+    # --------------------------------------------------------
+    # MINUTES / STARTING PROBABILITY
+    # --------------------------------------------------------
+
+    minutes_per_appearance = (
+        minutes
+        /
+        max(
+            starts,
+            1,
+        )
+    )
+
+
+    minutes_score = clamp(
+        minutes / 1000,
+        0,
+        1,
+    )
+
+
+    start_score = clamp(
+        starts / 20,
+        0,
+        1,
+    )
+
+
+    availability_score = (
+        chance_current / 100
+    )
+
+
+    # --------------------------------------------------------
+    # FORM
+    # --------------------------------------------------------
+
+    form_score = clamp(
+        form / 10,
+        0,
+        2,
+    )
+
+
+    ppg_score = clamp(
+        points_per_game / 8,
+        0,
+        1.5,
+    )
+
+
+    # --------------------------------------------------------
+    # ATTACK
+    # --------------------------------------------------------
+
+    xgi_score = clamp(
+        expected_goal_involvement / 10,
+        0,
+        2,
+    )
+
+
+    goal_score = clamp(
+        goals / 10,
+        0,
+        1.5,
+    )
+
+
+    assist_score = clamp(
+        assists / 10,
+        0,
+        1,
+    )
+
+
+    # --------------------------------------------------------
+    # ICT
+    # --------------------------------------------------------
+
+    ict_score = clamp(
+        ict_index / 200,
+        0,
+        1,
+    )
+
+
+    influence_score = clamp(
+        influence / 500,
+        0,
+        1,
+    )
+
+
+    creativity_score = clamp(
+        creativity / 500,
+        0,
+        1,
+    )
+
+
+    threat_score = clamp(
+        threat / 500,
+        0,
+        1,
+    )
+
+
+    # --------------------------------------------------------
+    # UPCOMING FIXTURES
+    # --------------------------------------------------------
+
+    upcoming = get_upcoming_fixtures(
+        team_id,
+        fixture_map,
+        current_gameweek,
+        UPCOMING_FIXTURES_TO_ANALYSE,
+    )
+
+
+    fixture_score = calculate_fixture_score(
+        upcoming
+    )
+
+
+    # --------------------------------------------------------
+    # POSITION WEIGHTS
+    # --------------------------------------------------------
+
+    if position == "FWD":
+
+        attack_weight = 1.45
+        clean_sheet_weight = 0.10
+
+    elif position == "MID":
+
+        attack_weight = 1.35
+        clean_sheet_weight = 0.15
+
+    elif position == "DEF":
+
+        attack_weight = 0.60
+        clean_sheet_weight = 0.75
+
+    else:
+
+        attack_weight = 0.25
+        clean_sheet_weight = 0.90
+
+
+    clean_sheet_score = clamp(
+        clean_sheets / 10,
+        0,
+        1,
+    )
+
+
+    # --------------------------------------------------------
+    # CORE FPL SCORE
+    # --------------------------------------------------------
+
+    score = (
+
+        form_score * 2.00
+
+        +
+
+        ppg_score * 1.30
+
+        +
+
+        minutes_score * 1.00
+
+        +
+
+        start_score * 0.80
+
+        +
+
+        fixture_score * 0.95
+
+        +
+
+        xgi_score * attack_weight
+
+        +
+
+        goal_score * 0.40
+
+        +
+
+        assist_score * 0.30
+
+        +
+
+        ict_score * 0.45
+
+        +
+
+        influence_score * 0.15
+
+        +
+
+        creativity_score * 0.15
+
+        +
+
+        threat_score * 0.15
+
+        +
+
+        clean_sheet_score
+        * clean_sheet_weight
+
+        +
+
+        bonus * 0.025
+
+        +
+
+        availability_score * 1.20
+
+    )
+
+
+    # --------------------------------------------------------
+    # AVAILABILITY PENALTY
+    # --------------------------------------------------------
+
+    if chance_current < 25:
+
+        score *= 0.20
+
+    elif chance_current < 50:
+
+        score *= 0.45
+
+    elif chance_current < 75:
+
+        score *= 0.75
+
+
+    if minutes_per_appearance < 45:
+
+        score *= 0.80
+
+
+    # --------------------------------------------------------
+    # VALUE
+    # --------------------------------------------------------
+
+    if price > 0:
+
+        value_score = (
+            score / price
+        )
+
+    else:
+
+        value_score = 0
+
+
+    # --------------------------------------------------------
+    # EXPECTED GOALS PER 90
+    #
+    # Bootstrap expected_goals is season-to-date.
+    # We normalise it by minutes when possible.
+    # --------------------------------------------------------
+
+    if minutes > 0:
+
+        xg_per_90 = (
+            expected_goals
+            /
+            minutes
+            *
+            90
+        )
+
+        xa_per_90 = (
+            expected_assists
+            /
+            minutes
+            *
+            90
+        )
+
+    else:
+
+        xg_per_90 = 0
+        xa_per_90 = 0
+
+
+    # --------------------------------------------------------
+    # LIKELY STARTER
+    # --------------------------------------------------------
+
+    starter_probability = clamp(
+        (
+            0.50 * availability_score
+            +
+            0.25 * start_score
+            +
+            0.25 * minutes_score
+        ),
+        0,
+        1,
+    )
+
+
+    return {
+
+        "id":
+            player_id,
+
+        "name":
+            name,
+
+        "full_name":
+            full_name,
+
+        "position":
+            position,
+
+        "position_id":
+            position_id,
+
+        "team_id":
+            team_id,
+
+        "team":
+            club,
+
+        "price":
+            price,
+
+        "total_points":
+            int(total_points),
+
+        "form":
+            round2(form),
+
+        "points_per_game":
+            round2(points_per_game),
+
+        "minutes":
+            int(minutes),
+
+        "starts":
+            int(starts),
+
+        "minutes_per_start":
+            round2(minutes_per_appearance),
+
+        "goals":
+            int(goals),
+
+        "assists":
+            int(assists),
+
+        "clean_sheets":
+            int(clean_sheets),
+
+        "bonus":
+            int(bonus),
+
+        "expected_goals":
+            round2(expected_goals),
+
+        "expected_assists":
+            round2(expected_assists),
+
+        "expected_goal_involvement":
+            round2(
+                expected_goal_involvement
+            ),
+
+        "xg_per_90":
+            round2(xg_per_90),
+
+        "xa_per_90":
+            round2(xa_per_90),
+
+        "ict_index":
+            round2(ict_index),
+
+        "influence":
+            round2(influence),
+
+        "creativity":
+            round2(creativity),
+
+        "threat":
+            round2(threat),
+
+        "chance_this_round":
+            chance_current,
+
+        "chance_next_round":
+            chance_next,
+
+        "status":
+            status,
+
+        "fixture_score":
+            round2(
+                fixture_score
+            ),
+
+        "starter_probability":
+            round(
+                starter_probability * 100,
+                1,
+            ),
+
+        "agent_score":
+            round(
+                score,
+                3,
+            ),
+
+        "value_score":
+            round(
+                value_score,
+                3,
+            ),
+
+        "upcoming_fixtures":
+            upcoming,
+
+    }
+
+
+# ============================================================
+# PLAYER POOL
+# ============================================================
+
+def build_player_pool(
+    players,
+    team_lookup,
+    fixture_map,
+    current_gameweek,
+):
+
+    analysed = []
+
+    for player in players:
+
+        try:
+
+            result = analyse_player(
+                player,
+                team_lookup,
+                fixture_map,
+                current_gameweek,
+            )
+
+            analysed.append(
+                result
+            )
+
+        except Exception as error:
+
+            print(
+                "Player analysis skipped:",
+                error,
+            )
+
+
+    return analysed
+
+
+# ============================================================
+# POSITION FILTER
+# ============================================================
+
+def by_position(
+    players,
+    position,
+):
+
+    return [
+
+        player
+
+        for player in players
+
+        if player["position"] == position
+
+    ]
+
+
+# ============================================================
+# REMOVE IMPOSSIBLE PLAYERS
+# ============================================================
+
+def usable_players(
+    players
+):
+
+    result = []
+
+    for player in players:
+
+        if player["price"] <= 0:
+            continue
+
+        if player[
+            "chance_this_round"
+        ] < 25:
+
+            continue
+
+        result.append(
+            player
+        )
+
+
+    return result
+
+
+# ============================================================
+# SQUAD COST
+# ============================================================
+
+def squad_cost(
+    squad
+):
+
+    return round(
+        sum(
+            player["price"]
+            for player in squad
+        ),
+        1,
+    )
+
+
+# ============================================================
+# CLUB COUNT
+# ============================================================
+
+def club_count(
+    squad,
+    team_id,
+):
+
+    return sum(
+        1
+        for player in squad
+        if player["team_id"] == team_id
+    )
+
+
+# ============================================================
+# SQUAD VALIDATION
+# ============================================================
+
+def valid_squad(
+    squad
+):
+
+    if len(squad) != SQUAD_SIZE:
+        return False
+
+
+    counts = {
+        "GK": 0,
+        "DEF": 0,
+        "MID": 0,
+        "FWD": 0,
+    }
+
+
+    for player in squad:
+
+        position = player[
+            "position"
+        ]
+
+        counts[position] += 1
+
+
+    for position, required in (
+        SQUAD_REQUIREMENTS.items()
+    ):
+
+        if counts[position] != required:
+
+            return False
+
+
+    clubs = {}
+
+    for player in squad:
+
+        team_id = player[
+            "team_id"
+        ]
+
+        clubs[team_id] = (
+            clubs.get(
+                team_id,
+                0,
+            )
+            + 1
+        )
+
+
+    if any(
+        count > MAX_PER_CLUB
+        for count in clubs.values()
+    ):
+
+        return False
+
+
+    if squad_cost(squad) > BUDGET:
+
+        return False
+
+
+    return True
+
+
+# ============================================================
+# INITIAL SQUAD
+# ============================================================
+
+def create_initial_squad(
+    players
+):
+
+    squad = []
+
+
+    for position, required in (
+        SQUAD_REQUIREMENTS.items()
+    ):
+
+        candidates = by_position(
+            players,
+            position,
+        )
+
+
+        candidates.sort(
+            key=lambda player:
+            (
+                player["price"],
+                -player["agent_score"],
+            )
+        )
+
+
+        for player in candidates:
+
+            if len(
+                [
+                    p
+                    for p in squad
+                    if p["position"] == position
+                ]
+            ) >= required:
+
+                break
+
+
+            if club_count(
+                squad,
+                player["team_id"],
+            ) >= MAX_PER_CLUB:
+
+                continue
+
+
+            squad.append(
+                player
+            )
+
+
+    if not valid_squad(
+        squad
+    ):
+
+        return None
+
+
+    return squad
+
+
+# ============================================================
+# SQUAD SCORE
+# ============================================================
+
+def squad_score(
+    squad
+):
+
+    return sum(
+        player["agent_score"]
+        for player in squad
+    )
+
+
+# ============================================================
+# UPGRADE SQUAD
+# ============================================================
+
+def improve_squad(
+    squad,
+    players,
+):
+
+    if not squad:
+
+        return None
+
+
+    squad = list(
+        squad
+    )
+
+
+    position_groups = {
+
+        position:
+        by_position(
+            players,
+            position,
+        )
+
+        for position
+        in SQUAD_REQUIREMENTS
+
+    }
+
+
+    improved = True
+
+    passes = 0
+
+
+    while improved and passes < 50:
+
+        improved = False
+
+        passes += 1
+
+
+        current_score = squad_score(
+            squad
+        )
+
+
+        for index, old_player in enumerate(
+            list(squad)
+        ):
+
+            candidates = position_groups[
+                old_player["position"]
+            ]
+
+
+            candidates = sorted(
+                candidates,
+                key=lambda player:
+                player["agent_score"],
+                reverse=True,
+            )
+
+
+            for new_player in candidates:
+
+                if new_player["id"] in {
+                    p["id"]
+                    for p in squad
+                }:
+
+                    continue
+
+
+                if (
+                    new_player["agent_score"]
+                    <=
+                    old_player["agent_score"]
+                ):
+
+                    continue
+
+
+                trial = list(
+                    squad
+                )
+
+                trial[index] = (
+                    new_player
+                )
+
+
+                if not valid_squad(
+                    trial
+                ):
+
+                    continue
+
+
+                new_score = squad_score(
+                    trial
+                )
+
+
+                if new_score > current_score:
+
+                    squad = trial
+
+                    improved = True
+
+                    break
+
+
+            if improved:
+
+                break
+
+
+    return squad
+
+
+# ============================================================
+# FIND BEST SQUAD
+# ============================================================
+
+def build_best_squad(
+    players
+):
+
+    candidates = usable_players(
+        players
+    )
+
+
+    # Keep strongest candidates per position
+    reduced = []
+
+
+    for position in SQUAD_REQUIREMENTS:
+
+        position_players = by_position(
+            candidates,
+            position,
+        )
+
+
+        position_players.sort(
+            key=lambda player:
+            player["agent_score"],
+            reverse=True,
+        )
+
+
+        reduced.extend(
+            position_players[
+                :TOP_CANDIDATES_PER_POSITION
+            ]
+        )
+
+
+    initial = create_initial_squad(
+        reduced
+    )
+
+
+    if not initial:
+
+        print(
+            "Could not create initial squad."
+        )
+
+        return None
+
+
+    best = improve_squad(
+        initial,
+        reduced,
+    )
+
+
+    return best
+
+
+# ============================================================
+# FORMATION VALIDATION
+# ============================================================
+
+def can_use_formation(
+    squad,
+    formation
+):
+
+    defenders_needed = formation[0]
+    midfielders_needed = formation[1]
+    forwards_needed = formation[2]
+
+
+    if len(
+        by_position(
+            squad,
+            "GK",
+        )
+    ) < 1:
+
+        return False
+
+
+    if len(
+        by_position(
+            squad,
+            "DEF",
+        )
+    ) < defenders_needed:
+
+        return False
+
+
+    if len(
+        by_position(
+            squad,
+            "MID",
+        )
+    ) < midfielders_needed:
+
+        return False
+
+
+    if len(
+        by_position(
+            squad,
+            "FWD",
+        )
+    ) < forwards_needed:
+
+        return False
+
+
+    return True
+
+
+# ============================================================
+# STARTING XI
+# ============================================================
+
+def build_starting_xi(
+    squad
+):
+
+    best_lineup = None
+
+
+    for formation in STARTING_FORMATIONS:
+
+        if not can_use_formation(
+            squad,
+            formation,
+        ):
+
+            continue
+
+
+        defenders_needed = formation[0]
+        midfielders_needed = formation[1]
+        forwards_needed = formation[2]
+
+
+        gks = sorted(
+            by_position(
+                squad,
+                "GK",
+            ),
+            key=lambda p:
+            p["agent_score"],
+            reverse=True,
+        )
+
+
+        defs = sorted(
+            by_position(
+                squad,
+                "DEF",
+            ),
+            key=lambda p:
+            p["agent_score"],
+            reverse=True,
+        )
+
+
+        mids = sorted(
+            by_position(
+                squad,
+                "MID",
+            ),
+            key=lambda p:
+            p["agent_score"],
+            reverse=True,
+        )
+
+
+        fwds = sorted(
+            by_position(
+                squad,
+                "FWD",
+            ),
+            key=lambda p:
+            p["agent_score"],
+            reverse=True,
+        )
+
+
+        lineup = []
+
+        lineup.append(
+            gks[0]
+        )
+
+        lineup.extend(
+            defs[
+                :defenders_needed
+            ]
+        )
+
+        lineup.extend(
+            mids[
+                :midfielders_needed
+            ]
+        )
+
+        lineup.extend(
+            fwds[
+                :forwards_needed
+            ]
+        )
+
+
+        if len(lineup) != 11:
+
+            continue
+
+
+        score = sum(
+            player["agent_score"]
+            for player in lineup
+        )
+
+
+        # Extra reward for high starter probability
+        score += sum(
+            player[
+                "starter_probability"
+            ] / 100
+            for player in lineup
+        )
+
+
+        candidate = {
+
+            "formation":
+                formation,
+
+            "players":
+                lineup,
+
+            "score":
+                round(
+                    score,
+                    3,
+                ),
+
         }
 
 
-    goals_for = 0
-    goals_against = 0
+        if (
+            best_lineup is None
+            or
+            candidate["score"]
+            >
+            best_lineup["score"]
+        ):
 
-    wins = 0
-    draws = 0
-    losses = 0
-
-    points = 0
-
-
-    for match in matches:
-
-        home_id = match[
-            "homeTeam"
-        ]["id"]
-
-        away_id = match[
-            "awayTeam"
-        ]["id"]
-
-        score = match.get(
-            "score",
-            {}
-        ).get(
-            "fullTime",
-            {}
-        )
-
-        home_goals = safe_float(
-            score.get("home")
-        )
-
-        away_goals = safe_float(
-            score.get("away")
-        )
+            best_lineup = candidate
 
 
-        if team_id == home_id:
-
-            gf = home_goals
-            ga = away_goals
-
-        else:
-
-            gf = away_goals
-            ga = home_goals
+    return best_lineup
 
 
-        goals_for += gf
-        goals_against += ga
+# ============================================================
+# BENCH
+# ============================================================
 
+def build_bench(
+    squad,
+    starting_xi,
+):
 
-        if gf > ga:
-
-            wins += 1
-            points += 3
-
-        elif gf == ga:
-
-            draws += 1
-            points += 1
-
-        else:
-
-            losses += 1
-
-
-    count = len(matches)
-
-
-    return {
-
-        "matches":
-            count,
-
-        "goals_for":
-            goals_for,
-
-        "goals_against":
-            goals_against,
-
-        "goals_for_avg":
-            goals_for / count,
-
-        "goals_against_avg":
-            goals_against / count,
-
-        "wins":
-            wins,
-
-        "draws":
-            draws,
-
-        "losses":
-            losses,
-
-        "points":
-            points,
-
-        "points_per_match":
-            points / count,
-
-        "win_rate":
-            wins / count,
-
+    starting_ids = {
+        player["id"]
+        for player
+        in starting_xi["players"]
     }
 
 
-# ============================================================
-# HOME / AWAY STATISTICS
-# ============================================================
+    bench = [
 
-def calculate_home_away_stats(
-    matches,
-    team_id
-):
+        player
 
-    home_games = 0
-    away_games = 0
+        for player in squad
 
-    home_for = 0
-    home_against = 0
+        if player["id"]
+        not in starting_ids
 
-    away_for = 0
-    away_against = 0
+    ]
 
 
-    for match in matches:
+    # Best first substitute,
+    # but preserve goalkeeper as last bench slot.
+    outfield = [
+        p
+        for p in bench
+        if p["position"] != "GK"
+    ]
 
-        home_id = match[
-            "homeTeam"
-        ]["id"]
-
-        away_id = match[
-            "awayTeam"
-        ]["id"]
-
-        score = match.get(
-            "score",
-            {}
-        ).get(
-            "fullTime",
-            {}
-        )
-
-        home_goals = safe_float(
-            score.get("home")
-        )
-
-        away_goals = safe_float(
-            score.get("away")
-        )
+    goalkeeper = [
+        p
+        for p in bench
+        if p["position"] == "GK"
+    ]
 
 
-        if team_id == home_id:
-
-            home_games += 1
-
-            home_for += home_goals
-            home_against += away_goals
-
-
-        elif team_id == away_id:
-
-            away_games += 1
-
-            away_for += away_goals
-            away_against += home_goals
-
-
-    return {
-
-        "home_games":
-            home_games,
-
-        "away_games":
-            away_games,
-
-        "home_goals_for_avg":
-            (
-                home_for / home_games
-                if home_games
-                else 0
-            ),
-
-        "home_goals_against_avg":
-            (
-                home_against / home_games
-                if home_games
-                else 0
-            ),
-
-        "away_goals_for_avg":
-            (
-                away_for / away_games
-                if away_games
-                else 0
-            ),
-
-        "away_goals_against_avg":
-            (
-                away_against / away_games
-                if away_games
-                else 0
-            ),
-    }
-
-
-# ============================================================
-# ELO
-# ============================================================
-
-def calculate_elo(
-    matches,
-    team_id,
-    initial_elo=1500
-):
-
-    elo = initial_elo
-
-    K = 25
-
-
-    # Oldest -> newest
-    matches = list(
-        reversed(matches)
+    outfield.sort(
+        key=lambda p:
+        p["agent_score"],
+        reverse=True,
     )
 
 
-    for match in matches:
+    goalkeeper.sort(
+        key=lambda p:
+        p["agent_score"],
+        reverse=True,
+    )
 
-        home_id = match[
-            "homeTeam"
-        ]["id"]
 
-        away_id = match[
-            "awayTeam"
-        ]["id"]
+    ordered = outfield
 
-        score = match.get(
-            "score",
-            {}
-        ).get(
-            "fullTime",
-            {}
-        )
+    if goalkeeper:
 
-        home_goals = safe_float(
-            score.get("home")
-        )
-
-        away_goals = safe_float(
-            score.get("away")
+        ordered.extend(
+            goalkeeper
         )
 
 
-        if home_goals > away_goals:
-
-            result = 1.0
-
-        elif home_goals == away_goals:
-
-            result = 0.5
-
-        else:
-
-            result = 0.0
-
-
-        if team_id == home_id:
-
-            opponent_elo = 1500
-
-            expected = (
-                1 /
-                (
-                    1 +
-                    10 ** (
-                        (opponent_elo - elo)
-                        / 400
-                    )
-                )
-            )
-
-            elo += K * (
-                result - expected
-            )
-
-
-        elif team_id == away_id:
-
-            opponent_elo = 1500
-
-            expected = (
-                1 /
-                (
-                    1 +
-                    10 ** (
-                        (opponent_elo - elo)
-                        / 400
-                    )
-                )
-            )
-
-            away_result = 1 - result
-
-            elo += K * (
-                away_result - expected
-            )
-
-
-    return elo
+    return ordered
 
 
 # ============================================================
-# EXPECTED GOALS
+# CAPTAIN SCORE
 # ============================================================
 
-def calculate_expected_goals(
-    home_stats,
-    away_stats,
-    home_split,
-    away_split,
-    home_elo,
-    away_elo
+def captain_score(
+    player
 ):
 
-    # --------------------------------------------------------
-    # HOME TEAM ATTACK
-    # --------------------------------------------------------
+    score = player[
+        "agent_score"
+    ]
+
+
+    # Attackers benefit more from xGI
+    score += (
+        player[
+            "expected_goal_involvement"
+        ]
+        *
+        0.45
+    )
+
+
+    # Good fixture
+    score += (
+        player[
+            "fixture_score"
+        ]
+        *
+        0.55
+    )
+
+
+    # Strong starting probability
+    score += (
+        player[
+            "starter_probability"
+        ]
+        /
+        100
+        *
+        1.20
+    )
+
+
+    # Availability is important for captain
+    score *= (
+        0.70
+        +
+        (
+            player[
+                "chance_this_round"
+            ]
+            /
+            100
+        )
+        *
+        0.30
+    )
+
+
+    return score
+
+
+# ============================================================
+# CAPTAIN + VICE
+# ============================================================
+
+def choose_captains(
+    starting_xi
+):
+
+    candidates = []
+
+    for player in starting_xi[
+        "players"
+    ]:
+
+        score = captain_score(
+            player
+        )
+
+        candidates.append(
+            (
+                score,
+                player,
+            )
+        )
+
+
+    candidates.sort(
+        key=lambda item:
+        item[0],
+        reverse=True,
+    )
+
+
+    captain = (
+        candidates[0][1]
+        if candidates
+        else None
+    )
+
+
+    vice = (
+        candidates[1][1]
+        if len(candidates) > 1
+        else None
+    )
+
+
+    return captain, vice
+
+
+# ============================================================
+# TEAM STRENGTH
+# ============================================================
+
+def team_strength(
+    team
+):
+
+    # FPL exposes several strength indicators.
+    #
+    # We combine them into a practical model
+    # for match prediction.
+
+    overall = number(
+        team.get(
+            "strength",
+            1000,
+        ),
+        1000,
+    )
+
+
+    attack_home = number(
+        team.get(
+            "strength_attack_home",
+            overall,
+        ),
+        overall,
+    )
+
+    attack_away = number(
+        team.get(
+            "strength_attack_away",
+            overall,
+        ),
+        overall,
+    )
+
+
+    defence_home = number(
+        team.get(
+            "strength_defence_home",
+            overall,
+        ),
+        overall,
+    )
+
+    defence_away = number(
+        team.get(
+            "strength_defence_away",
+            overall,
+        ),
+        overall,
+    )
+
+
+    return {
+
+        "overall":
+            overall,
+
+        "attack_home":
+            attack_home,
+
+        "attack_away":
+            attack_away,
+
+        "defence_home":
+            defence_home,
+
+        "defence_away":
+            defence_away,
+
+    }
+
+
+# ============================================================
+# MATCH EXPECTED GOALS
+# ============================================================
+
+def match_expected_goals(
+    home_team,
+    away_team,
+):
+
+    home = team_strength(
+        home_team
+    )
+
+    away = team_strength(
+        away_team
+    )
+
+
+    # FPL strength values are relative.
+    # Convert difference into a controlled multiplier.
 
     home_attack = (
-        home_split[
-            "home_goals_for_avg"
-        ]
+        home["attack_home"]
+        /
+        max(
+            away["defence_away"],
+            1,
+        )
     )
 
-    home_defence = (
-        home_split[
-            "home_goals_against_avg"
-        ]
-    )
-
-
-    # --------------------------------------------------------
-    # AWAY TEAM ATTACK
-    # --------------------------------------------------------
 
     away_attack = (
-        away_split[
-            "away_goals_for_avg"
-        ]
-    )
-
-    away_defence = (
-        away_split[
-            "away_goals_against_avg"
-        ]
+        away["attack_away"]
+        /
+        max(
+            home["defence_home"],
+            1,
+        )
     )
 
 
-    # --------------------------------------------------------
-    # RECENT FORM
-    # --------------------------------------------------------
-
-    home_form = (
-        home_stats[
-            "goals_for_avg"
-        ] * 0.55
-        +
-        (
-            1 /
-            (
-                1 +
-                home_stats[
-                    "goals_against_avg"
-                ]
-            )
-        ) * 0.45
-    )
-
-
-    away_form = (
-        away_stats[
-            "goals_for_avg"
-        ] * 0.55
-        +
-        (
-            1 /
-            (
-                1 +
-                away_stats[
-                    "goals_against_avg"
-                ]
-            )
-        ) * 0.45
-    )
-
-
-    # --------------------------------------------------------
-    # BASE EXPECTED GOALS
-    # --------------------------------------------------------
+    # Normalise around a practical football baseline.
+    #
+    # The exact constants are deliberately conservative;
+    # we don't want absurd 6-0 predictions.
 
     home_xg = (
-        home_attack * 0.45
-        +
-        away_defence * 0.35
-        +
-        home_form * 0.20
+        1.35
+        *
+        math.sqrt(
+            max(
+                home_attack,
+                0.20,
+            )
+        )
     )
 
 
     away_xg = (
-        away_attack * 0.45
-        +
-        home_defence * 0.35
-        +
-        away_form * 0.20
+        1.05
+        *
+        math.sqrt(
+            max(
+                away_attack,
+                0.20,
+            )
+        )
     )
 
 
-    # --------------------------------------------------------
-    # HOME ADVANTAGE
-    # --------------------------------------------------------
+    # Overall strength adjustment
 
-    home_xg *= 1.10
-
-
-    # --------------------------------------------------------
-    # ELO DIFFERENCE
-    # --------------------------------------------------------
-
-    elo_difference = (
-        home_elo - away_elo
-    )
-
-    elo_factor = clamp(
-        elo_difference / 400,
-        -0.5,
-        0.5
-    )
-
-
-    home_xg *= (
-        1 + elo_factor * 0.12
-    )
-
-    away_xg *= (
-        1 - elo_factor * 0.08
-    )
-
-
-    # --------------------------------------------------------
-    # FORM DIFFERENCE
-    # --------------------------------------------------------
-
-    points_difference = (
-        home_stats[
-            "points_per_match"
-        ]
+    strength_difference = (
+        home["overall"]
         -
-        away_stats[
-            "points_per_match"
-        ]
+        away["overall"]
     )
 
 
-    points_factor = clamp(
-        points_difference / 3,
-        -0.5,
-        0.5
+    adjustment = clamp(
+        strength_difference / 1000,
+        -0.35,
+        0.35,
     )
 
 
     home_xg *= (
-        1 + points_factor * 0.08
+        1
+        +
+        adjustment
+        *
+        0.25
     )
 
+
     away_xg *= (
-        1 - points_factor * 0.05
+        1
+        -
+        adjustment
+        *
+        0.15
     )
 
 
@@ -655,56 +2255,58 @@ def calculate_expected_goals(
         "home":
             clamp(
                 home_xg,
-                0.10,
-                4.50
+                0.15,
+                4.50,
             ),
 
         "away":
             clamp(
                 away_xg,
                 0.10,
-                4.50
+                3.80,
             ),
 
     }
 
 
 # ============================================================
-# SCORE MATRIX
+# MATCH SCORE MATRIX
 # ============================================================
 
-def build_score_matrix(
+def calculate_match_probabilities(
     home_xg,
-    away_xg
+    away_xg,
 ):
 
     matrix = {}
 
-    home_win = 0
-    draw = 0
-    away_win = 0
+    home_win = 0.0
+    draw = 0.0
+    away_win = 0.0
 
 
     for home_goals in range(
-        MAX_GOALS + 1
+        0,
+        7,
     ):
 
         for away_goals in range(
-            MAX_GOALS + 1
+            0,
+            7,
         ):
 
             probability = (
 
                 poisson_probability(
                     home_goals,
-                    home_xg
+                    home_xg,
                 )
 
                 *
 
                 poisson_probability(
                     away_goals,
-                    away_xg
+                    away_xg,
                 )
 
             )
@@ -743,578 +2345,1001 @@ def build_score_matrix(
     )
 
 
-    return {
+    if total <= 0:
 
-        "matrix":
-            matrix,
+        total = 1
 
-        "home_win":
-            home_win / total,
 
-        "draw":
-            draw / total,
+    home_win /= total
+    draw /= total
+    away_win /= total
 
-        "away_win":
-            away_win / total,
-
-    }
-
-
-# ============================================================
-# BEST SCORE
-# ============================================================
-
-def get_best_score(
-    matrix
-):
-
-    return max(
-        matrix,
-        key=matrix.get
-    )
-
-
-# ============================================================
-# PREDICT ONE MATCH
-# ============================================================
-
-def predict_match(
-    home_name,
-    away_name,
-    home_id,
-    away_id,
-    competition
-):
-
-    print("")
-    print(
-        f"Analysing: "
-        f"{home_name} vs {away_name}"
-    )
-
-
-    # --------------------------------------------------------
-    # HISTORICAL DATA
-    # --------------------------------------------------------
-
-    home_matches = get_team_matches(
-        competition,
-        home_id
-    )
-
-    away_matches = get_team_matches(
-        competition,
-        away_id
-    )
-
-
-    if not home_matches:
-        raise RuntimeError(
-            f"No data for {home_name}"
-        )
-
-    if not away_matches:
-        raise RuntimeError(
-            f"No data for {away_name}"
-        )
-
-
-    # --------------------------------------------------------
-    # TEAM STATS
-    # --------------------------------------------------------
-
-    home_stats = (
-        calculate_team_stats(
-            home_matches,
-            home_id
-        )
-    )
-
-    away_stats = (
-        calculate_team_stats(
-            away_matches,
-            away_id
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # HOME/AWAY
-    # --------------------------------------------------------
-
-    home_split = (
-        calculate_home_away_stats(
-            home_matches,
-            home_id
-        )
-    )
-
-    away_split = (
-        calculate_home_away_stats(
-            away_matches,
-            away_id
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # ELO
-    # --------------------------------------------------------
-
-    home_elo = calculate_elo(
-        home_matches,
-        home_id
-    )
-
-    away_elo = calculate_elo(
-        away_matches,
-        away_id
-    )
-
-
-    # --------------------------------------------------------
-    # EXPECTED GOALS
-    # --------------------------------------------------------
-
-    expected_goals = (
-        calculate_expected_goals(
-
-            home_stats,
-
-            away_stats,
-
-            home_split,
-
-            away_split,
-
-            home_elo,
-
-            away_elo
-
-        )
-    )
-
-
-    home_xg = expected_goals[
-        "home"
-    ]
-
-    away_xg = expected_goals[
-        "away"
-    ]
-
-
-    # --------------------------------------------------------
-    # SCORE MATRIX
-    # --------------------------------------------------------
-
-    score_data = build_score_matrix(
-        home_xg,
-        away_xg
-    )
-
-
-    matrix = score_data[
-        "matrix"
-    ]
-
-
-    best_score = get_best_score(
-        matrix
-    )
-
-
-    # --------------------------------------------------------
-    # RESULT PROBABILITIES
-    # --------------------------------------------------------
-
-    home_probability = (
-        score_data[
-            "home_win"
-        ]
-    )
-
-    draw_probability = (
-        score_data[
-            "draw"
-        ]
-    )
-
-    away_probability = (
-        score_data[
-            "away_win"
-        ]
-    )
-
-
-    probabilities = {
-
-        "home_win":
-            round(
-                home_probability * 100,
-                2
-            ),
-
-        "draw":
-            round(
-                draw_probability * 100,
-                2
-            ),
-
-        "away_win":
-            round(
-                away_probability * 100,
-                2
-            ),
-
-    }
-
-
-    # --------------------------------------------------------
-    # FINAL RESULT
-    # --------------------------------------------------------
-
-    result_map = {
-
-        "HOME":
-            home_probability,
-
-        "DRAW":
-            draw_probability,
-
-        "AWAY":
-            away_probability,
-
-    }
-
-
-    prediction = max(
-        result_map,
-        key=result_map.get
-    )
-
-
-    confidence = (
-        result_map[
-            prediction
-        ] * 100
-    )
-
-
-    # --------------------------------------------------------
-    # TOP SCORES
-    # --------------------------------------------------------
 
     top_scores = sorted(
         matrix.items(),
-        key=lambda item: item[1],
-        reverse=True
-    )[:5]
-
-
-    top_scores = [
-
-        {
-            "score":
-                score,
-
-            "probability":
-                round(
-                    probability * 100,
-                    2
-                ),
-        }
-
-        for score, probability
-        in top_scores
-
-    ]
+        key=lambda item:
+        item[1],
+        reverse=True,
+    )[:8]
 
 
     return {
 
-        "match": {
+        "home_win":
+            home_win,
 
-            "home":
-                home_name,
+        "draw":
+            draw,
 
-            "away":
-                away_name,
-
-            "competition":
-                competition,
-
-        },
-
-        "prediction":
-            prediction,
-
-        "probabilities":
-            probabilities,
-
-        "confidence":
-            round(
-                confidence,
-                2
-            ),
-
-        "expected_goals": {
-
-            "home":
-                round(
-                    home_xg,
-                    2
-                ),
-
-            "away":
-                round(
-                    away_xg,
-                    2
-                ),
-
-        },
-
-        "most_likely_score":
-            best_score,
+        "away_win":
+            away_win,
 
         "top_scores":
-            top_scores,
+            [
+                {
+                    "score":
+                        score,
 
-        "model_data": {
+                    "probability":
+                        round(
+                            probability * 100,
+                            2,
+                        ),
+                }
 
-            "home_elo":
-                round(
-                    home_elo,
-                    1
-                ),
-
-            "away_elo":
-                round(
-                    away_elo,
-                    1
-                ),
-
-            "home_form":
-                home_stats,
-
-            "away_form":
-                away_stats,
-
-        },
+                for score, probability
+                in top_scores
+            ],
 
     }
 
 
 # ============================================================
-# UPCOMING MATCHES
+# LIKELY GOAL SCORERS
 # ============================================================
 
-def get_upcoming_matches(
-    competition
+def calculate_goal_scorers(
+    players,
+    team_id,
+    team_xg,
 ):
 
-    url = (
-        f"{BASE_URL}/competitions/"
-        f"{competition}/matches"
-        f"?status=SCHEDULED"
+    candidates = [
+
+        player
+
+        for player in players
+
+        if player["team_id"] == team_id
+
+        and player["position"]
+        in (
+            "MID",
+            "FWD",
+        )
+
+        and player[
+            "chance_this_round"
+        ] >= 50
+
+        and player[
+            "minutes"
+        ] >= 180
+
+    ]
+
+
+    if not candidates:
+
+        return []
+
+
+    scorer_values = []
+
+
+    for player in candidates:
+
+        xg90 = player[
+            "xg_per_90"
+        ]
+
+
+        if xg90 <= 0:
+
+            # If xG isn't available early season,
+            # use goals and threat as fallback.
+
+            xg90 = (
+                player["goals"]
+                /
+                max(
+                    player["minutes"],
+                    90,
+                )
+                *
+                90
+            )
+
+
+        attacking_signal = (
+
+            xg90 * 2.5
+
+            +
+
+            player[
+                "threat"
+            ] / 250
+
+            +
+
+            player[
+                "expected_goal_involvement"
+            ] / 8
+
+            +
+
+            player[
+                "starter_probability"
+            ] / 100
+
+        )
+
+
+        # Midfielders receive a slight assist contribution.
+        attacking_signal += (
+            player[
+                "xa_per_90"
+            ]
+            *
+            0.50
+        )
+
+
+        attacking_signal *= (
+            player[
+                "chance_this_round"
+            ]
+            /
+            100
+        )
+
+
+        scorer_values.append(
+            (
+                attacking_signal,
+                player,
+            )
+        )
+
+
+    scorer_values.sort(
+        key=lambda item:
+        item[0],
+        reverse=True,
     )
 
-    data = get_json(url)
 
-    return data.get(
-        "matches",
-        []
+    top = scorer_values[:5]
+
+
+    total = sum(
+        value
+        for value, player
+        in top
     )
+
+
+    results = []
+
+
+    for value, player in top:
+
+        if total > 0:
+
+            relative_probability = (
+                value / total
+            )
+
+        else:
+
+            relative_probability = 0
+
+
+        # This is NOT a bookmaker probability.
+        # It is the model's relative scorer ranking.
+
+        results.append({
+
+            "player":
+                player["name"],
+
+            "team":
+                player["team"],
+
+            "position":
+                player["position"],
+
+            "model_share":
+                round(
+                    relative_probability * 100,
+                    2,
+                ),
+
+            "xg_per_90":
+                player["xg_per_90"],
+
+            "starter_probability":
+                player[
+                    "starter_probability"
+                ],
+
+        })
+
+
+    return results
 
 
 # ============================================================
-# ANALYSE COMPETITION
+# PREDICT ALL UPCOMING FIXTURES
 # ============================================================
 
-def analyse_competition(
-    code
+def predict_upcoming_matches(
+    fixtures,
+    teams,
+    players,
+    current_gameweek,
 ):
 
-    matches = get_upcoming_matches(
-        code
+    team_lookup = build_team_lookup(
+        teams
     )
 
-    predictions = []
+
+    results = []
 
 
-    for match in matches:
+    for fixture in fixtures:
 
-        home = match.get(
-            "homeTeam",
-            {}
-        )
+        if fixture.get(
+            "finished",
+            False,
+        ):
 
-        away = match.get(
-            "awayTeam",
-            {}
-        )
-
-
-        home_id = home.get("id")
-        away_id = away.get("id")
-
-
-        if not home_id or not away_id:
             continue
+
+
+        event = fixture.get(
+            "event"
+        )
+
+
+        if event is None:
+
+            continue
+
+
+        event = integer(
+            event
+        )
+
+
+        if event <= current_gameweek:
+
+            continue
+
+
+        home_id = integer(
+            fixture.get(
+                "team_h"
+            )
+        )
+
+        away_id = integer(
+            fixture.get(
+                "team_a"
+            )
+        )
+
+
+        home_team = team_lookup.get(
+            home_id
+        )
+
+        away_team = team_lookup.get(
+            away_id
+        )
+
+
+        if not home_team or not away_team:
+
+            continue
+
+
+        home_name = home_team.get(
+            "name",
+            "Unknown",
+        )
+
+        away_name = away_team.get(
+            "name",
+            "Unknown",
+        )
 
 
         try:
 
-            prediction = predict_match(
-
-                home.get(
-                    "name",
-                    "Unknown"
-                ),
-
-                away.get(
-                    "name",
-                    "Unknown"
-                ),
-
-                home_id,
-
-                away_id,
-
-                code
-
+            expected = match_expected_goals(
+                home_team,
+                away_team,
             )
 
 
-            prediction[
-                "date"
-            ] = match.get(
-                "utcDate"
-            )
+            probabilities = (
+                calculate_match_probabilities(
 
-            prediction[
-                "match_id"
-            ] = match.get(
-                "id"
+                    expected["home"],
+
+                    expected["away"],
+
+                )
             )
 
 
-            predictions.append(
-                prediction
+            home_probability = (
+                probabilities[
+                    "home_win"
+                ]
             )
+
+            draw_probability = (
+                probabilities[
+                    "draw"
+                ]
+            )
+
+            away_probability = (
+                probabilities[
+                    "away_win"
+                ]
+            )
+
+
+            options = {
+
+                "HOME":
+                    home_probability,
+
+                "DRAW":
+                    draw_probability,
+
+                "AWAY":
+                    away_probability,
+
+            }
+
+
+            prediction = max(
+                options,
+                key=options.get,
+            )
+
+
+            confidence = (
+                options[
+                    prediction
+                ]
+                *
+                100
+            )
+
+
+            home_scorers = (
+                calculate_goal_scorers(
+                    players,
+                    home_id,
+                    expected["home"],
+                )
+            )
+
+
+            away_scorers = (
+                calculate_goal_scorers(
+                    players,
+                    away_id,
+                    expected["away"],
+                )
+            )
+
+
+            results.append({
+
+                "gameweek":
+                    event,
+
+                "fixture_id":
+                    fixture.get(
+                        "id"
+                    ),
+
+                "kickoff":
+                    fixture.get(
+                        "kickoff_time"
+                    ),
+
+                "home":
+                    home_name,
+
+                "away":
+                    away_name,
+
+                "prediction":
+                    prediction,
+
+                "confidence":
+                    round(
+                        confidence,
+                        2,
+                    ),
+
+                "probabilities": {
+
+                    "home_win":
+                        round(
+                            home_probability * 100,
+                            2,
+                        ),
+
+                    "draw":
+                        round(
+                            draw_probability * 100,
+                            2,
+                        ),
+
+                    "away_win":
+                        round(
+                            away_probability * 100,
+                            2,
+                        ),
+
+                },
+
+                "expected_goals": {
+
+                    "home":
+                        round(
+                            expected["home"],
+                            2,
+                        ),
+
+                    "away":
+                        round(
+                            expected["away"],
+                            2,
+                        ),
+
+                },
+
+                "most_likely_score":
+                    probabilities[
+                        "top_scores"
+                    ][0]["score"],
+
+                "top_scores":
+                    probabilities[
+                        "top_scores"
+                    ],
+
+                "likely_scorers": {
+
+                    "home":
+                        home_scorers,
+
+                    "away":
+                        away_scorers,
+
+                },
+
+            })
 
 
         except Exception as error:
 
             print(
-                "Skipped match:",
-                error
+                "Match prediction failed:",
+                home_name,
+                "vs",
+                away_name,
+                "|",
+                error,
             )
 
 
-    return predictions
+    results.sort(
+        key=lambda item:
+        (
+            item["gameweek"],
+            item["confidence"],
+        ),
+        reverse=False,
+    )
+
+
+    return results
 
 
 # ============================================================
-# CLEAN USER OUTPUT
+# FORMAT UPCOMING FIXTURES FOR PLAYERS
 # ============================================================
 
-def print_final_prediction(
-    prediction
+def make_fixture_summary(
+    player,
+    team_lookup,
 ):
 
-    match = prediction[
-        "match"
-    ]
+    output = []
 
-    probabilities = prediction[
-        "probabilities"
-    ]
+
+    for fixture in player[
+        "upcoming_fixtures"
+    ]:
+
+        opponent = team_lookup.get(
+            fixture["opponent"],
+            {},
+        )
+
+
+        opponent_name = opponent.get(
+            "short_name",
+            "UNK",
+        )
+
+
+        if fixture["home"]:
+
+            label = (
+                "H vs "
+                +
+                opponent_name
+            )
+
+        else:
+
+            label = (
+                "A vs "
+                +
+                opponent_name
+            )
+
+
+        output.append({
+
+            "gameweek":
+                fixture["event"],
+
+            "fixture":
+                label,
+
+            "difficulty":
+                fixture["difficulty"],
+
+            "kickoff":
+                fixture["kickoff"],
+
+        })
+
+
+    return output
+
+
+# ============================================================
+# FINAL FPL REPORT
+# ============================================================
+
+def build_fpl_report(
+    analysed_players,
+    best_squad,
+    starting_xi,
+    bench,
+    captain,
+    vice_captain,
+    gameweek_info,
+    team_lookup,
+):
+
+    report = {
+
+        "generated_at":
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+
+        "gameweek": {
+
+            "current":
+                gameweek_info[
+                    "current"
+                ],
+
+            "next":
+                gameweek_info[
+                    "next"
+                ],
+
+        },
+
+        "budget": {
+
+            "maximum":
+                BUDGET,
+
+            "squad_cost":
+                squad_cost(
+                    best_squad
+                ),
+
+            "remaining":
+                round(
+                    BUDGET
+                    -
+                    squad_cost(
+                        best_squad
+                    ),
+                    1,
+                ),
+
+        },
+
+        "squad": {
+
+            "size":
+                len(best_squad),
+
+            "players":
+                best_squad,
+
+        },
+
+        "starting_xi": {
+
+            "formation":
+                starting_xi[
+                    "formation"
+                ],
+
+            "players":
+                starting_xi[
+                    "players"
+                ],
+
+        },
+
+        "bench":
+            bench,
+
+        "captain":
+            captain,
+
+        "vice_captain":
+            vice_captain,
+
+        "top_players": {
+
+            "GK":
+                sorted(
+                    by_position(
+                        analysed_players,
+                        "GK",
+                    ),
+                    key=lambda p:
+                    p["agent_score"],
+                    reverse=True,
+                )[:15],
+
+            "DEF":
+                sorted(
+                    by_position(
+                        analysed_players,
+                        "DEF",
+                    ),
+                    key=lambda p:
+                    p["agent_score"],
+                    reverse=True,
+                )[:20],
+
+            "MID":
+                sorted(
+                    by_position(
+                        analysed_players,
+                        "MID",
+                    ),
+                    key=lambda p:
+                    p["agent_score"],
+                    reverse=True,
+                )[:20],
+
+            "FWD":
+                sorted(
+                    by_position(
+                        analysed_players,
+                        "FWD",
+                    ),
+                    key=lambda p:
+                    p["agent_score"],
+                    reverse=True,
+                )[:20],
+
+        },
+
+    }
+
+
+    # Add human-readable fixture summaries
+    for section in (
+        report["squad"]["players"],
+        report["starting_xi"]["players"],
+        report["bench"],
+        report["top_players"]["GK"],
+        report["top_players"]["DEF"],
+        report["top_players"]["MID"],
+        report["top_players"]["FWD"],
+    ):
+
+        for player in section:
+
+            player[
+                "fixture_summary"
+            ] = make_fixture_summary(
+                player,
+                team_lookup,
+            )
+
+
+    return report
+
+
+# ============================================================
+# PRINT SQUAD
+# ============================================================
+
+def print_squad(
+    report
+):
+
+    print("")
+    print("=" * 60)
+    print("BEST FPL SQUAD")
+    print("=" * 60)
+
+    print(
+        "Budget:",
+        report["budget"]["maximum"],
+        "M"
+    )
+
+    print(
+        "Cost:",
+        report["budget"]["squad_cost"],
+        "M"
+    )
+
+    print(
+        "Remaining:",
+        report["budget"]["remaining"],
+        "M"
+    )
 
 
     print("")
-    print(
-        "========================================"
-    )
+    print("15 PLAYERS")
+    print("-" * 60)
 
-    print(
-        "          FINAL PREDICTION"
-    )
 
-    print(
-        "========================================"
-    )
+    for player in report[
+        "squad"
+    ]["players"]:
 
-    print("")
-    print(
-        match["home"],
-        "vs",
-        match["away"]
-    )
+        print(
+            f"{player['position']:3} "
+            f"{player['name']:<20} "
+            f"{player['team']:<5} "
+            f"£{player['price']:<5} "
+            f"Score={player['agent_score']}"
+        )
+
 
     print("")
+    print("=" * 60)
+    print("STARTING XI")
+    print("=" * 60)
+
 
     print(
-        "Prediction:",
-        prediction["prediction"]
+        "Formation:",
+        report[
+            "starting_xi"
+        ]["formation"]
     )
 
-    print(
-        "Home:",
-        probabilities["home_win"],
-        "%"
-    )
 
-    print(
-        "Draw:",
-        probabilities["draw"],
-        "%"
-    )
+    for player in report[
+        "starting_xi"
+    ]["players"]:
 
-    print(
-        "Away:",
-        probabilities["away_win"],
-        "%"
-    )
+        print(
+            f"{player['position']:3} "
+            f"{player['name']:<20} "
+            f"{player['team']:<5} "
+            f"Score={player['agent_score']}"
+        )
+
 
     print("")
+    print("=" * 60)
+    print("BENCH")
+    print("=" * 60)
 
-    print(
-        "Expected score:",
-        prediction[
-            "most_likely_score"
-        ]
-    )
 
-    print(
-        "Expected goals:",
-        prediction[
-            "expected_goals"
-        ]
-    )
-
-    print(
-        "Confidence:",
-        prediction[
-            "confidence"
-        ],
-        "%"
-    )
-
-    print("")
-    print(
-        "Top possible scores:"
-    )
-
-    for item in prediction[
-        "top_scores"
+    for player in report[
+        "bench"
     ]:
 
         print(
-            item["score"],
-            "->",
-            item["probability"],
-            "%"
+            f"{player['position']:3} "
+            f"{player['name']:<20} "
+            f"{player['team']:<5} "
+            f"£{player['price']:<5}"
+        )
+
+
+    print("")
+    print("=" * 60)
+    print("CAPTAIN")
+    print("=" * 60)
+
+
+    if report["captain"]:
+
+        print(
+            report["captain"]["name"],
+            "|",
+            report["captain"]["team"],
+        )
+
+
+    print("")
+    print("VICE-CAPTAIN")
+
+
+    if report["vice_captain"]:
+
+        print(
+            report[
+                "vice_captain"
+            ]["name"],
+            "|",
+            report[
+                "vice_captain"
+            ]["team"],
+        )
+
+
+# ============================================================
+# PRINT MATCH PREDICTIONS
+# ============================================================
+
+def print_match_predictions(
+    predictions,
+    limit=15,
+):
+
+    print("")
+    print("=" * 60)
+    print("MATCH PREDICTIONS")
+    print("=" * 60)
+
+
+    for prediction in predictions[:limit]:
+
+        print("")
+        print(
+            f"GW{prediction['gameweek']} "
+            f"{prediction['home']} "
+            f"vs "
+            f"{prediction['away']}"
+        )
+
+
+        print(
+            "Prediction:",
+            prediction["prediction"],
+        )
+
+
+        print(
+            "Confidence:",
+            prediction["confidence"],
+            "%",
+        )
+
+
+        print(
+            "Probabilities:",
+            prediction[
+                "probabilities"
+            ],
+        )
+
+
+        print(
+            "Expected goals:",
+            prediction[
+                "expected_goals"
+            ],
+        )
+
+
+        print(
+            "Most likely score:",
+            prediction[
+                "most_likely_score"
+            ],
+        )
+
+
+        print(
+            "Top scores:",
+            prediction[
+                "top_scores"
+            ][:3],
+        )
+
+
+        print(
+            "Likely scorers HOME:",
+            [
+                x["player"]
+                for x
+                in prediction[
+                    "likely_scorers"
+                ]["home"][:3]
+            ],
+        )
+
+
+        print(
+            "Likely scorers AWAY:",
+            [
+                x["player"]
+                for x
+                in prediction[
+                    "likely_scorers"
+                ]["away"][:3]
+            ],
+        )
+
+
+# ============================================================
+# SAVE JSON
+# ============================================================
+
+def save_json(
+    filename,
+    data,
+):
+
+    with open(
+        filename,
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        json.dump(
+            data,
+            file,
+            ensure_ascii=False,
+            indent=2,
         )
 
 
@@ -1325,132 +3350,362 @@ def print_final_prediction(
 def main():
 
     print("")
-    print(
-        "========================================"
+    print("=" * 60)
+    print("FPL AUTONOMOUS AGENT")
+    print("DEEP PLAYER + FIXTURE + MATCH ANALYSIS")
+    print("=" * 60)
+    print("")
+
+
+    # --------------------------------------------------------
+    # LOAD DATABASE
+    # --------------------------------------------------------
+
+    data = load_fpl_database()
+
+
+    players = data[
+        "players"
+    ]
+
+    events = data[
+        "events"
+    ]
+
+    teams = data[
+        "teams"
+    ]
+
+    fixtures = data[
+        "fixtures"
+    ]
+
+
+    # --------------------------------------------------------
+    # GAMEWEEK
+    # --------------------------------------------------------
+
+    gameweek_info = get_gameweek_info(
+        events
     )
 
-    print(
-        "     FOOTBALL PREDICTION AGENT v1"
-    )
 
-    print(
-        "========================================"
-    )
+    current_gameweek = gameweek_info[
+        "current"
+    ]
 
-
-    if not API_KEY:
-
-        print("")
-        print(
-            "ERROR: Missing API key."
-        )
-
-        print(
-            "Add FOOTBALL_DATA_API_KEY "
-            "to GitHub Actions secrets."
-        )
-
-        return
-
-
-    all_predictions = []
-
-
-    for code, name in COMPETITIONS.items():
-
-        print("")
-        print(
-            "Loading:",
-            name
-        )
-
-        try:
-
-            predictions = (
-                analyse_competition(
-                    code
-                )
-            )
-
-            all_predictions.extend(
-                predictions
-            )
-
-        except Exception as error:
-
-            print(
-                name,
-                "failed:",
-                error
-            )
-
-
-    # --------------------------------------------------------
-    # SAVE FULL DATA
-    # --------------------------------------------------------
-
-    output = {
-
-        "generated_at":
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
-
-        "predictions":
-            all_predictions,
-
-    }
-
-
-    with open(
-        "predictions.json",
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        json.dump(
-            output,
-            file,
-            ensure_ascii=False,
-            indent=2
-        )
-
-
-    # --------------------------------------------------------
-    # SHOW FIRST PREDICTIONS
-    # --------------------------------------------------------
-
-    for prediction in all_predictions[:10]:
-
-        print_final_prediction(
-            prediction
-        )
+    next_gameweek = gameweek_info[
+        "next"
+    ]
 
 
     print("")
     print(
-        "========================================"
+        "Current GW:",
+        current_gameweek,
     )
 
     print(
-        "DONE"
+        "Next GW:",
+        next_gameweek,
+    )
+
+
+    # --------------------------------------------------------
+    # LOOKUPS
+    # --------------------------------------------------------
+
+    team_lookup = build_team_lookup(
+        teams
+    )
+
+
+    fixture_map = build_fixture_map(
+        fixtures
+    )
+
+
+    # --------------------------------------------------------
+    # PLAYER ANALYSIS
+    # --------------------------------------------------------
+
+    print("")
+    print("=" * 60)
+    print("ANALYSING PLAYERS")
+    print("=" * 60)
+
+
+    analysed_players = build_player_pool(
+        players,
+        team_lookup,
+        fixture_map,
+        current_gameweek,
+    )
+
+
+    print(
+        "Analysed:",
+        len(
+            analysed_players
+        ),
+        "players"
+    )
+
+
+    # --------------------------------------------------------
+    # BEST SQUAD
+    # --------------------------------------------------------
+
+    print("")
+    print("=" * 60)
+    print("BUILDING £100M SQUAD")
+    print("=" * 60)
+
+
+    best_squad = build_best_squad(
+        analysed_players
+    )
+
+
+    if not best_squad:
+
+        raise RuntimeError(
+            "Unable to build valid £100M squad."
+        )
+
+
+    # --------------------------------------------------------
+    # STARTING XI
+    # --------------------------------------------------------
+
+    starting_xi = build_starting_xi(
+        best_squad
+    )
+
+
+    if not starting_xi:
+
+        raise RuntimeError(
+            "Unable to build starting XI."
+        )
+
+
+    # --------------------------------------------------------
+    # BENCH
+    # --------------------------------------------------------
+
+    bench = build_bench(
+        best_squad,
+        starting_xi,
+    )
+
+
+    # --------------------------------------------------------
+    # CAPTAIN
+    # --------------------------------------------------------
+
+    captain, vice_captain = choose_captains(
+        starting_xi
+    )
+
+
+    # --------------------------------------------------------
+    # FPL REPORT
+    # --------------------------------------------------------
+
+    report = build_fpl_report(
+
+        analysed_players,
+
+        best_squad,
+
+        starting_xi,
+
+        bench,
+
+        captain,
+
+        vice_captain,
+
+        gameweek_info,
+
+        team_lookup,
+
+    )
+
+
+    # --------------------------------------------------------
+    # MATCH PREDICTIONS
+    # --------------------------------------------------------
+
+    print("")
+    print("=" * 60)
+    print("PREDICTING UPCOMING MATCHES")
+    print("=" * 60)
+
+
+    predictions = predict_upcoming_matches(
+
+        fixtures,
+
+        teams,
+
+        analysed_players,
+
+        current_gameweek,
+
+    )
+
+
+    # --------------------------------------------------------
+    # SAVE EVERYTHING
+    # --------------------------------------------------------
+
+    full_output = {
+
+        "agent": {
+
+            "name":
+                "FPL Autonomous Agent",
+
+            "version":
+                "2.0",
+
+            "generated_at":
+                datetime.now(
+                    timezone.utc
+                ).isoformat(),
+
+        },
+
+        "team_id":
+            TEAM_ID,
+
+        "gameweek":
+            gameweek_info,
+
+        "fpl_report":
+            report,
+
+        "match_predictions":
+            predictions,
+
+        "analysed_players":
+            analysed_players,
+
+    }
+
+
+    save_json(
+        "fpl_data.json",
+        full_output,
+    )
+
+
+    # --------------------------------------------------------
+    # HUMAN OUTPUT
+    # --------------------------------------------------------
+
+    print_squad(
+        report
+    )
+
+
+    print_match_predictions(
+        predictions
+    )
+
+
+    # --------------------------------------------------------
+    # FINAL STATUS
+    # --------------------------------------------------------
+
+    print("")
+    print("=" * 60)
+    print("AGENT FINISHED")
+    print("=" * 60)
+
+
+    print(
+        "Gameweek:",
+        next_gameweek,
     )
 
     print(
-        "Matches analysed:",
-        len(all_predictions)
+        "Squad cost:",
+        report[
+            "budget"
+        ]["squad_cost"],
+        "M",
     )
 
     print(
-        "Saved:",
-        "predictions.json"
+        "Remaining:",
+        report[
+            "budget"
+        ]["remaining"],
+        "M",
     )
+
+
+    if captain:
+
+        print(
+            "Captain:",
+            captain["name"],
+        )
+
+
+    if vice_captain:
+
+        print(
+            "Vice-Captain:",
+            vice_captain["name"],
+        )
+
 
     print(
-        "========================================"
+        "Matches predicted:",
+        len(predictions),
     )
 
+
+    print(
+        "Output:",
+        "fpl_data.json",
+    )
+
+
+    print("")
+    print(
+        "Ready for next stage."
+    )
+
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
 
-    main()
+    try:
+
+        main()
+
+    except Exception as error:
+
+        print("")
+        print("=" * 60)
+        print("AGENT ERROR")
+        print("=" * 60)
+
+        print(
+            str(error)
+        )
+
+        print("")
+        print(
+            "The program stopped safely."
+        )
+
+        raise
